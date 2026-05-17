@@ -26,4 +26,5 @@ services:
       - ../:/root/ros2_ws/src/ai_worker/
       - ../../pymoveit2:/root/ros2_ws/src/pymoveit2
       - /var/run/robotis/agent_sockets/ai_worker:/var/run/agent
+      - /usr/local/cuda-11.8:/usr/local/cuda
     privileged: true
