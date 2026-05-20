@@ -142,7 +142,10 @@ enter_container() {
         print_update_notice "${CURRENT_VER}" "${GIT_VER}"
     fi
 
-    docker exec -it "$CONTAINER_NAME" bash
+    docker exec -it "$CONTAINER_NAME" bash -c "
+        echo 'export PYTHONPATH=/root/ros2_ws/src/ai_worker/python_packages:\$PYTHONPATH' >> ~/.bashrc
+        exec bash
+    "
 }
 
 # Function to stop the container

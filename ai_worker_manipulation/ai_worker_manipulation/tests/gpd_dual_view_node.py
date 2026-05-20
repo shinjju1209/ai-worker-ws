@@ -144,7 +144,7 @@ class GpdDualViewNode(Node):
     def __init__(self):
         super().__init__('gpd_dual_view')
 
-        self.declare_parameter('gpd_dir',      '/home/jiwoo/ai-worker-ws/gpd')
+        self.declare_parameter('gpd_dir',      '/root/ros2_ws/src/ai_worker/gpd')
         self.declare_parameter('gpd_config',   'cfg/eigen_params.cfg')
         self.declare_parameter('left_topic',   '/camera_left/points_base')
         self.declare_parameter('right_topic',  '/camera_right/points_base')

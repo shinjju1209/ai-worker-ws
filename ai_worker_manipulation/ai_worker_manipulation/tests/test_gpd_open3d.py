@@ -76,46 +76,35 @@ def run_gpd(pcd_path, scene_name, camera_positions):
         print(f"    position: {g['position']}")
         print(f"    approach: {g['approach']}")
 
-# AI Worker 양팔 카메라 시점
+# =============================================
+# AI Worker 양팔 카메라 시점 (위에서 비스듬히)
+# =============================================
 camera_positions = [
-    np.array([0.3, -0.2, 0.3]),  # 오른팔 카메라
-    np.array([0.3,  0.2, 0.3]),  # 왼팔 카메라
+    np.array([0.0, -0.35, 0.3]),   # 오른팔 측면
+    np.array([0.0,  0.35, 0.3]),   # 왼팔 측면
 ]
 
 # =============================================
-# 여러 물체가 있는 Scene 생성
-# 테이블 위에 물체들이 놓여있는 상황
+# Stanford Bunny - 실제 스캔 데이터 (사각지대 있음)
 # =============================================
+print("Bunny 포인트 클라우드 생성 중...")
+bunny = o3d.data.BunnyMesh()
+mesh = o3d.io.read_triangle_mesh(bunny.path)
+mesh.compute_vertex_normals()
+mesh.scale(0.7, center=mesh.get_center())
+pcd_full = mesh.sample_points_uniformly(number_of_points=20000)
 
-# 1. 실린더 (음료캔) - 왼쪽
-cyl = o3d.geometry.TriangleMesh.create_cylinder(radius=0.03, height=0.12)
-cyl.translate(np.array([-0.1, 0.0, 0.06]))  # 왼쪽에 배치
-
-# 2. 박스 - 가운데
-box = o3d.geometry.TriangleMesh.create_box(width=0.06, height=0.06, depth=0.08)
-box.translate(np.array([0.0, 0.0, 0.04]))   # 가운데 배치
-
-# 3. 구 - 오른쪽
-sphere = o3d.geometry.TriangleMesh.create_sphere(radius=0.03)
-sphere.translate(np.array([0.1, 0.0, 0.03]))  # 오른쪽에 배치
-
-# 4. 바닥 (테이블)
-table = o3d.geometry.TriangleMesh.create_box(width=0.5, height=0.5, depth=0.01)
-table.translate(np.array([-0.25, -0.25, -0.01]))
-
-# 각 mesh를 포인트 클라우드로 변환 후 합성
+# 양팔 카메라 시점 합성
 all_points = []
-for mesh in [cyl, box, sphere, table]:
-    pcd_full = mesh.sample_points_uniformly(number_of_points=5000)
-    for cam_pos in camera_positions:
-        pcd_view = capture_from_viewpoint(pcd_full, cam_pos)
-        all_points.append(np.asarray(pcd_view.points))
+for cam_pos in camera_positions:
+    pcd_view = capture_from_viewpoint(pcd_full, cam_pos)
+    all_points.append(np.asarray(pcd_view.points))
 
-# 합성 + 다운샘플링
-scene_pcd = o3d.geometry.PointCloud()
-scene_pcd.points = o3d.utility.Vector3dVector(np.vstack(all_points))
-scene_pcd = scene_pcd.voxel_down_sample(voxel_size=0.003)
-print(f"Scene 포인트 수: {len(scene_pcd.points)}")
+pcd_combined = o3d.geometry.PointCloud()
+pcd_combined.points = o3d.utility.Vector3dVector(np.vstack(all_points))
+pcd_combined, _ = pcd_combined.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
+pcd_combined = pcd_combined.voxel_down_sample(voxel_size=0.003)
+print(f"포인트 수: {len(pcd_combined.points)}")
 
-o3d.io.write_point_cloud("/tmp/test_scene.pcd", scene_pcd)
-run_gpd("/tmp/test_scene.pcd", "멀티 오브젝트 Scene (실린더+박스+구+테이블)", camera_positions)
+o3d.io.write_point_cloud("/tmp/test_bunny_dual.pcd", pcd_combined)
+run_gpd("/tmp/test_bunny_dual.pcd", "Bunny 양팔 카메라 시점", camera_positions)
