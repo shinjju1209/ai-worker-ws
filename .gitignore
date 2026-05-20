@@ -532,3 +532,4 @@ doc/
 ## GurumDDS
 *.ar
 
+python_packages/

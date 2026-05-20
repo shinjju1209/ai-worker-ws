@@ -258,6 +258,12 @@ target_link_libraries(${PROJECT_NAME}_detect_grasps
   ${PROJECT_NAME}_config_file
 ${PCL_LIBRARIES})
 
+# Python ctypes용 멀티뷰 C API
+add_library(gpd_python_wrapper SHARED src/gpd_python_wrapper.cpp)
+target_link_libraries(gpd_python_wrapper
+  ${PROJECT_NAME}_grasp_detector
+  ${PCL_LIBRARIES})
+
 target_link_libraries(${PROJECT_NAME}_label_grasps
   ${PROJECT_NAME}_grasp_detector
   ${PROJECT_NAME}_config_file

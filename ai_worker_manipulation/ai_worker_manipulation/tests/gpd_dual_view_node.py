@@ -3,8 +3,8 @@
 Dual-view GPD grasp detection node.
 
 팀원이 TF 변환 완료한 두 PointCloud2 토픽을 구독해서:
-  1. 두 클라우드 합성 (filter/downsample)
-  2. GPD CLI 실행
+  1. 두 클라우드 합성 + 카메라 인덱스 추적
+  2. libgpd_python_wrapper.so C API 호출 (멀티뷰 normal 계산)
   3. geometry_msgs/PoseArray 로 grasp pose 퍼블리시
 
 Subscriptions:
@@ -15,13 +15,10 @@ Publish:
   /gpd/grasp_poses (PoseArray, frame_id = base_link)
 """
 
+import ctypes
 import os
-import re
-import subprocess
-import tempfile
 
 import numpy as np
-import open3d as o3d
 import rclpy
 import tf2_ros
 from geometry_msgs.msg import Pose, PoseArray
@@ -31,6 +28,33 @@ from sensor_msgs.msg import PointCloud2
 from sensor_msgs_py import point_cloud2 as pc2
 
 import message_filters
+
+_FIELDS_PER_GRASP = 14  # [score, px,py,pz, app_x,app_y,app_z, bin_x,bin_y,bin_z, ax_x,ax_y,ax_z, width]
+
+
+# ---------------------------------------------------------------------------
+# ctypes 라이브러리 로드
+# ---------------------------------------------------------------------------
+
+def _load_gpd_lib(gpd_dir: str) -> ctypes.CDLL:
+    so_path = os.path.join(gpd_dir, 'build', 'libgpd_python_wrapper.so')
+    lib = ctypes.CDLL(so_path)
+
+    lib.detect_grasps_multi_view.restype  = ctypes.POINTER(ctypes.c_double)
+    lib.detect_grasps_multi_view.argtypes = [
+        ctypes.c_char_p,                        # config_path
+        ctypes.POINTER(ctypes.c_float),          # points
+        ctypes.POINTER(ctypes.c_int),            # camera_index
+        ctypes.POINTER(ctypes.c_float),          # view_points
+        ctypes.c_int,                            # num_points
+        ctypes.c_int,                            # num_cameras
+        ctypes.POINTER(ctypes.c_int),            # num_grasps_out
+    ]
+
+    lib.free_grasp_data.restype  = None
+    lib.free_grasp_data.argtypes = [ctypes.POINTER(ctypes.c_double)]
+
+    return lib
 
 
 # ---------------------------------------------------------------------------
@@ -45,86 +69,52 @@ def pointcloud2_to_xyz(msg: PointCloud2) -> np.ndarray:
     return np.array(pts, dtype=np.float64)
 
 
-def merge_and_filter(pts_left: np.ndarray, pts_right: np.ndarray,
-                     voxel_size: float) -> o3d.geometry.PointCloud:
-    """두 배열 합치고 outlier 제거 + voxel downsample."""
-    parts = [p for p in (pts_left, pts_right) if len(p) > 0]
-    if not parts:
-        return o3d.geometry.PointCloud()
-    all_pts = np.vstack(parts)
+def merge_with_index(pts_l: np.ndarray, pts_r: np.ndarray):
+    """두 클라우드를 합치고 카메라 인덱스 배열을 함께 반환.
 
-    pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(all_pts)
-    pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
-    pcd = pcd.voxel_down_sample(voxel_size=voxel_size)
-    return pcd
+    outlier 제거는 eigen_params.cfg 의 remove_outliers=1 로 GPD 내부에서 처리.
 
-
-def make_temp_config(base_cfg_path: str, view_point: np.ndarray) -> str:
-    """GPD cfg를 복사하고 camera_position을 view_point 로 교체해 임시 파일 반환."""
-    with open(base_cfg_path, 'r') as f:
-        content = f.read()
-
-    new_pos = f'{view_point[0]:.6f} {view_point[1]:.6f} {view_point[2]:.6f}'
-    content = re.sub(r'camera_position\s*=.*', f'camera_position = {new_pos}', content)
-
-    tmp = tempfile.NamedTemporaryFile(mode='w', suffix='.cfg', delete=False, prefix='gpd_')
-    tmp.write(content)
-    tmp.close()
-    return tmp.name
-
-
-def parse_gpd_output(stdout: str) -> list[dict]:
-    """GPD stdout 파싱 → grasp dict 리스트.
-
-    각 dict: score, position, approach, binormal, axis (모두 np.ndarray)
+    Returns:
+        all_pts   : (N, 3) float32
+        cam_index : (N,)   int32   — 왼쪽=0, 오른쪽=1
     """
-    grasps: list[dict] = []
-    cur: dict = {}
+    parts = [p for p in (pts_l, pts_r) if len(p) > 0]
+    if not parts:
+        return np.zeros((0, 3), dtype=np.float32), np.zeros(0, dtype=np.int32)
 
-    def _parse_xyz(line: str) -> np.ndarray:
-        vals = line.split('x=')[1].split(', y=')
-        x = float(vals[0])
-        y_str, z_str = vals[1].split(', z=')
-        return np.array([x, float(y_str), float(z_str)])
+    all_pts = np.vstack(parts).astype(np.float32)
+    cam_idx = np.array(
+        [0] * len(pts_l) + [1] * len(pts_r), dtype=np.int32)
+    return all_pts, cam_idx
 
-    for line in stdout.splitlines():
-        if 'Grasp' in line and 'score:' in line:
-            if cur:
-                grasps.append(cur)
-            score = float(line.split('score:')[1].replace(')', '').strip())
-            cur = {'score': score}
-        elif cur:
-            if 'position:' in line:
-                cur['position'] = _parse_xyz(line)
-            elif 'approach:' in line:
-                cur['approach'] = _parse_xyz(line)
-            elif 'binormal:' in line:
-                cur['binormal'] = _parse_xyz(line)
-            elif 'axis:' in line:
-                cur['axis'] = _parse_xyz(line)
 
-    if cur:
-        grasps.append(cur)
+def parse_grasp_array(raw: np.ndarray, n: int) -> list[dict]:
+    """C API 반환값(flat double 배열) → grasp dict 리스트."""
+    grasps = []
+    for i in range(n):
+        g = raw[i * _FIELDS_PER_GRASP: (i + 1) * _FIELDS_PER_GRASP]
+        grasps.append({
+            'score':    float(g[0]),
+            'position': g[1:4].copy(),
+            'approach': g[4:7].copy(),
+            'binormal': g[7:10].copy(),
+            'axis':     g[10:13].copy(),
+            'width':    float(g[13]),
+        })
     return grasps
 
 
 def grasp_to_pose(grasp: dict) -> Pose:
-    """GPD grasp dict → geometry_msgs/Pose (quaternion 변환 포함)."""
+    """GPD grasp dict → geometry_msgs/Pose."""
     pose = Pose()
 
-    pos = grasp.get('position', np.zeros(3))
+    pos = grasp['position']
     pose.position.x = float(pos[0])
     pose.position.y = float(pos[1])
     pose.position.z = float(pos[2])
 
-    approach = grasp.get('approach', np.array([1.0, 0.0, 0.0]))
-    binormal = grasp.get('binormal', np.array([0.0, 1.0, 0.0]))
-    axis     = grasp.get('axis',     np.array([0.0, 0.0, 1.0]))
-
-    # GPD hand frame: approach=x, binormal=y, axis=z
-    R = np.column_stack([approach, binormal, axis])
-    R, _ = np.linalg.qr(R)  # orthonormalize
+    R = np.column_stack([grasp['approach'], grasp['binormal'], grasp['axis']])
+    R, _ = np.linalg.qr(R)
     if np.linalg.det(R) < 0:
         R[:, 2] *= -1
 
@@ -144,16 +134,27 @@ class GpdDualViewNode(Node):
     def __init__(self):
         super().__init__('gpd_dual_view')
 
-        self.declare_parameter('gpd_dir',      '/root/ros2_ws/src/ai_worker/gpd')
-        self.declare_parameter('gpd_config',   'cfg/eigen_params.cfg')
-        self.declare_parameter('left_topic',   '/camera_left/points_base')
-        self.declare_parameter('right_topic',  '/camera_right/points_base')
-        self.declare_parameter('left_frame',   'camera_l_depth_optical_frame')
-        self.declare_parameter('right_frame',  'camera_r_depth_optical_frame')
-        self.declare_parameter('base_frame',   'base_link')
-        self.declare_parameter('voxel_size',   0.003)
-        self.declare_parameter('sync_slop',    0.1)
-        self.declare_parameter('gpd_timeout',  60.0)
+        self.declare_parameter('gpd_dir',     '/root/ros2_ws/src/ai_worker/gpd')
+        self.declare_parameter('gpd_config',  'cfg/eigen_params.cfg')
+        self.declare_parameter('left_topic',  '/camera_left/points_base')
+        self.declare_parameter('right_topic', '/camera_right/points_base')
+        self.declare_parameter('left_frame',  'camera_l_depth_optical_frame')
+        self.declare_parameter('right_frame', 'camera_r_depth_optical_frame')
+        self.declare_parameter('base_frame',  'base_link')
+        self.declare_parameter('sync_slop',   0.1)
+
+        gpd_dir = self.get_parameter('gpd_dir').value
+        try:
+            self._lib = _load_gpd_lib(gpd_dir)
+            self.get_logger().info('libgpd_python_wrapper.so loaded.')
+        except OSError as e:
+            self.get_logger().error(f'Failed to load GPD library: {e}')
+            self.get_logger().error(
+                'Run: cd gpd/build && cmake .. && make gpd_python_wrapper')
+            raise
+
+        self._config_path = os.path.join(
+            gpd_dir, self.get_parameter('gpd_config').value).encode()
 
         self.tf_buffer   = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
@@ -169,11 +170,7 @@ class GpdDualViewNode(Node):
         self.sync.registerCallback(self._on_clouds)
 
         self.grasp_pub = self.create_publisher(PoseArray, '/gpd/grasp_poses', 10)
-
-        self.get_logger().info(
-            f"Subscribing: {self.get_parameter('left_topic').value}, "
-            f"{self.get_parameter('right_topic').value}")
-        self.get_logger().info("GPD dual-view node ready.")
+        self.get_logger().info('GPD dual-view node ready.')
 
     # ------------------------------------------------------------------
     def _get_camera_position(self, camera_frame: str) -> np.ndarray | None:
@@ -182,9 +179,9 @@ class GpdDualViewNode(Node):
             t = self.tf_buffer.lookup_transform(
                 base_frame, camera_frame, rclpy.time.Time())
             tr = t.transform.translation
-            return np.array([tr.x, tr.y, tr.z])
+            return np.array([tr.x, tr.y, tr.z], dtype=np.float32)
         except tf2_ros.TransformException as e:
-            self.get_logger().warn(f'TF lookup failed ({camera_frame} → {base_frame}): {e}')
+            self.get_logger().warn(f'TF lookup failed ({camera_frame}→{base_frame}): {e}')
             return None
 
     # ------------------------------------------------------------------
@@ -205,77 +202,58 @@ class GpdDualViewNode(Node):
             self.get_logger().warn('TF not ready, skipping.')
             return
 
-        # 두 카메라 중간점을 GPD camera_position 으로 사용
-        view_point = (cam_l + cam_r) / 2.0
-
-        grasps = self._run_gpd(pts_l, pts_r, view_point)
+        grasps = self._run_gpd(pts_l, pts_r, cam_l, cam_r)
 
         self.get_logger().info(f'GPD detected {len(grasps)} grasps.')
         for i, g in enumerate(grasps):
-            pos = g.get('position', np.zeros(3))
+            pos = g['position']
             self.get_logger().info(
-                f'  [{i}] score={g["score"]:.3f}  pos=({pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f})')
+                f'  [{i}] score={g["score"]:.3f}  '
+                f'pos=({pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f})')
 
         self._publish(grasps)
 
     # ------------------------------------------------------------------
     def _run_gpd(self, pts_l: np.ndarray, pts_r: np.ndarray,
-                 view_point: np.ndarray) -> list[dict]:
-        gpd_dir    = self.get_parameter('gpd_dir').value
-        config_rel = self.get_parameter('gpd_config').value
-        config_abs = os.path.join(gpd_dir, config_rel)
-        voxel_size = self.get_parameter('voxel_size').value
-        timeout    = self.get_parameter('gpd_timeout').value
+                 cam_l: np.ndarray, cam_r: np.ndarray) -> list[dict]:
+        all_pts, cam_idx = merge_with_index(pts_l, pts_r)
+        n = len(all_pts)
 
-        pcd = merge_and_filter(pts_l, pts_r, voxel_size)
-        self.get_logger().info(f'Merged PCD: {len(pcd.points)} pts after filter/downsample')
-
-        if len(pcd.points) == 0:
+        if n == 0:
             self.get_logger().warn('Merged PCD is empty.')
             return []
 
-        tmp_pcd = tempfile.NamedTemporaryFile(suffix='.pcd', delete=False, prefix='gpd_in_')
-        tmp_pcd.close()
-        tmp_cfg = None
+        self.get_logger().info(f'Merged PCD: {n} pts (left={int((cam_idx==0).sum())}, right={int((cam_idx==1).sum())})')
 
-        try:
-            o3d.io.write_point_cloud(tmp_pcd.name, pcd)
-            tmp_cfg = make_temp_config(config_abs, view_point)
+        # view_points: [cam_l_x, cam_l_y, cam_l_z, cam_r_x, cam_r_y, cam_r_z]
+        view_pts = np.concatenate([cam_l, cam_r]).astype(np.float32)
 
-            result = subprocess.run(
-                ['./build/detect_grasps', tmp_cfg, tmp_pcd.name],
-                cwd=gpd_dir,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-                env={**os.environ, 'LIBGL_ALWAYS_SOFTWARE': '1'},
-            )
+        num_grasps_out = ctypes.c_int(0)
+        result_ptr = self._lib.detect_grasps_multi_view(
+            self._config_path,
+            all_pts.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            cam_idx.ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
+            view_pts.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            ctypes.c_int(n),
+            ctypes.c_int(2),
+            ctypes.byref(num_grasps_out),
+        )
 
-            if result.returncode != 0:
-                self.get_logger().error(f'GPD exited with code {result.returncode}')
-                self.get_logger().error(result.stderr[-500:])
-                return []
-
-            return parse_gpd_output(result.stdout)
-
-        except subprocess.TimeoutExpired:
-            self.get_logger().error(f'GPD timed out after {timeout}s.')
+        n_grasps = num_grasps_out.value
+        if n_grasps == 0 or not result_ptr:
             return []
-        except FileNotFoundError:
-            self.get_logger().error(
-                f"GPD binary not found: {gpd_dir}/build/detect_grasps")
-            return []
-        finally:
-            os.unlink(tmp_pcd.name)
-            if tmp_cfg:
-                os.unlink(tmp_cfg)
+
+        raw = np.ctypeslib.as_array(result_ptr, shape=(n_grasps * _FIELDS_PER_GRASP,)).copy()
+        self._lib.free_grasp_data(result_ptr)
+
+        return parse_grasp_array(raw, n_grasps)
 
     # ------------------------------------------------------------------
     def _publish(self, grasps: list[dict]):
         msg = PoseArray()
         msg.header.stamp    = self.get_clock().now().to_msg()
         msg.header.frame_id = self.get_parameter('base_frame').value
-        msg.poses = [grasp_to_pose(g) for g in grasps if 'position' in g]
+        msg.poses = [grasp_to_pose(g) for g in grasps]
         self.grasp_pub.publish(msg)
 
 
