@@ -42,7 +42,7 @@ from sensor_msgs_py import point_cloud2 as pc2
 # ---------------------------------------------------------------------------
 MIN_POINTS         = 50
 APPROACH_THRESHOLD = 0.3   # camera-approach cosine similarity
-POSITION_RADIUS    = 0.07  # grasp position이 물체 중심에서 허용 거리 (m)
+POSITION_RADIUS    = 1.0  # grasp position이 물체 중심에서 허용 거리 (m)
 MAX_GRASPS         = 8
 
 GPD_DIR = '/root/ros2_ws/src/ai_worker/gpd'

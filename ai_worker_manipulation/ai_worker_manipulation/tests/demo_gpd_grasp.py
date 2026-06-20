@@ -15,12 +15,12 @@ from ai_worker_manipulation.robot_interface.gripper_controller import GripperInt
 from ai_worker_manipulation.skill_primitives.environment import setup_environment
 
 
-GRASP_POSITION    = [0.3014, -0.2542, 0.8930]
-GRASP_ORIENTATION = [0.3846, -0.0636, 0.0507, 0.9195]
-#GRASP_ORIENTATION = [0.4969, 0.3461, -0.2238, 0.7637]
+GRASP_POSITION    = [0.4318, -0.0381, 0.8211]
+GRASP_ORIENTATION = [0.2241, -0.2344, -0.5705, 0.7546]
+#GRASP_ORIENTATION = [0.0, 0.0, 0.0, 1.0]
 
 LIFT_POSITION     = -0.0   # 15cm 내리기 (0.0 = 최상단, -0.5 = 최하단)
-APPROACH_HEIGHT   = 0.10    # pre-grasp: 목표 위 10cm에서 접근 후 lift로 하강
+APPROACH_HEIGHT   = 0.20    # pre-grasp: 목표 위 10cm에서 접근 후 lift로 하강
 
 
 def move_lift(node: Node, position: float, cb_group) -> None:
